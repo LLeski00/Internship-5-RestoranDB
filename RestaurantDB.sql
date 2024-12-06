@@ -92,7 +92,7 @@ CREATE TABLE Orders (
 	RestaurantId INT REFERENCES Restaurants(RestaurantId) NOT NULL,
 	OrderType OrderType NOT NULL,
 	DateOfOrder DATE NOT NULL DEFAULT CURRENT_DATE CHECK (DateOfOrder <= CURRENT_DATE),
-	TotalAmount DECIMAL(10, 2) NOT NULL CHECK (TotalAmount >= 0)
+	TotalAmount DECIMAL(10, 2) NOT NULL DEFAULT 0 CHECK (TotalAmount >= 0)
 );
 
 CREATE TABLE Deliveries (
@@ -147,24 +147,82 @@ CREATE TRIGGER trigger_check_delivery_option
 BEFORE INSERT ON Orders
 FOR EACH ROW EXECUTE FUNCTION check_delivery_option();
 
-CREATE OR REPLACE FUNCTION calculate_total_amount() 
+CREATE OR REPLACE FUNCTION check_dish_availability()
+RETURNS TRIGGER AS $$
+DECLARE
+    restaurant_id INT;
+BEGIN
+	SELECT RestaurantId INTO restaurant_id
+	FROM Orders
+	WHERE OrderId = NEW.OrderId;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM RestaurantDishes
+        WHERE RestaurantId = restaurant_id
+          AND DishId = NEW.DishId
+          AND Availability = TRUE
+    ) THEN
+        RAISE EXCEPTION 'Dish % is not available at the restaurant', NEW.DishId;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_check_dish_availability
+BEFORE INSERT ON OrderDishes
+FOR EACH ROW EXECUTE FUNCTION check_dish_availability();
+
+CREATE OR REPLACE FUNCTION set_order_dish_price()
+RETURNS TRIGGER AS $$
+DECLARE
+    restaurant_id INT;
+BEGIN
+	SELECT RestaurantId INTO restaurant_id
+	FROM Orders
+	WHERE OrderId = NEW.OrderId;
+
+    SELECT Price INTO NEW.Price
+    FROM RestaurantDishes
+    WHERE RestaurantId = restaurant_id
+      AND DishId = NEW.DishId;
+
+	IF NEW.Price IS NULL THEN
+	  RAISE EXCEPTION 'Price for the dish not found in the restaurant menu';
+    END IF;
+
+	NEW.Price := NEW.Price * NEW.Quantity;
+	
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_set_price
+BEFORE INSERT OR UPDATE
+ON OrderDishes
+FOR EACH ROW
+EXECUTE FUNCTION set_order_dish_price();
+
+CREATE OR REPLACE FUNCTION calculate_order_total()
 RETURNS TRIGGER AS $$
 BEGIN
     UPDATE Orders
     SET TotalAmount = (
-        SELECT SUM(od.Quantity * od.Price)
+        SELECT COALESCE(SUM(od.Price), 0)
         FROM OrderDishes od
         WHERE od.OrderId = NEW.OrderId
     )
     WHERE OrderId = NEW.OrderId;
-    
+
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER trigger_calculate_total_amount
-BEFORE INSERT OR UPDATE ON OrderDishes
-FOR EACH ROW EXECUTE FUNCTION calculate_total_amount();
+AFTER INSERT OR UPDATE ON OrderDishes
+FOR EACH ROW
+EXECUTE FUNCTION calculate_order_total();
 
 CREATE OR REPLACE FUNCTION check_loyalty_eligibility() 
 RETURNS TRIGGER AS $$
@@ -172,16 +230,17 @@ DECLARE
     total_orders INT;
     total_spent DECIMAL(10, 2);
 BEGIN
-    SELECT COUNT(*), SUM(TotalAmount) 
-    INTO total_orders, total_spent
-    FROM Orders
-    WHERE CustomerId = NEW.CustomerId;
-    
-    IF total_orders >= 15 AND total_spent >= 1000 THEN
-        RETURN NEW;
-    ELSE
-        RAISE EXCEPTION 'Customer does not meet the criteria for loyalty: 15 orders and total amount >= 1000';
+    IF NEW.LoyalMember = TRUE AND (NEW.LoyalMember IS DISTINCT FROM OLD.LoyalMember OR OLD IS NULL) THEN
+        SELECT COUNT(*), COALESCE(SUM(TotalAmount), 0) 
+        INTO total_orders, total_spent
+        FROM Orders
+        WHERE CustomerId = NEW.CustomerId;
+        
+        IF total_orders < 15 OR total_spent < 1000 THEN
+            RAISE EXCEPTION 'Customer does not meet the criteria for loyalty: 15 orders and total amount >= 1000';
+        END IF;
     END IF;
+    RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -207,18 +266,18 @@ ON Deliveries
 FOR EACH ROW
 EXECUTE FUNCTION check_order_type_for_delivery();
 
-CREATE OR REPLACE FUNCTION check_worker_is_delivery_person() 
+CREATE OR REPLACE FUNCTION check_delivery_person() 
 RETURNS TRIGGER AS $$ 
 BEGIN 
     IF (SELECT JobTitle FROM Workers WHERE WorkerId = NEW.WorkerId) <> 'Delivery person' THEN
         RAISE EXCEPTION 'Only workers with the job title "Delivery person" can be assigned to deliveries';
     END IF;
 
-    IF (SELECT RestaurantId FROM Orders WHERE OrderId = NEW.OrderId) <> 
-       (SELECT RestaurantId FROM Workers WHERE WorkerId = NEW.WorkerId) THEN
-        RAISE EXCEPTION 'The worker must be from the same restaurant as the order';
-    END IF;
-    
+    IF COALESCE((SELECT RestaurantId FROM Orders WHERE OrderId = NEW.OrderId), 0) <> 
+	   COALESCE((SELECT RestaurantId FROM Workers WHERE WorkerId = NEW.WorkerId), 0) THEN
+	   	RAISE EXCEPTION 'The worker must be from the same restaurant as the order';
+	END IF;
+
     RETURN NEW; 
 END; 
 $$ LANGUAGE plpgsql;
@@ -227,28 +286,4 @@ CREATE TRIGGER trigger_check_worker_is_delivery_person
 BEFORE INSERT
 ON Deliveries
 FOR EACH ROW
-EXECUTE FUNCTION check_worker_is_delivery_person();
-
-CREATE OR REPLACE FUNCTION set_order_dish_price()
-RETURNS TRIGGER AS $$
-BEGIN
-    SELECT Price INTO NEW.Price
-    FROM RestaurantDishes
-    WHERE RestaurantId = NEW.RestaurantId
-      AND DishId = NEW.DishId;
-
-    IF NEW.Price IS NULL THEN
-        RAISE EXCEPTION 'Price for the dish not found in the restaurant menu';
-    END IF;
-
-    NEW.Price := NEW.Price * NEW.Quantity;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER trigger_set_order_dish_price
-BEFORE INSERT
-ON OrderDishes
-FOR EACH ROW
-EXECUTE FUNCTION set_order_dish_price();
+EXECUTE FUNCTION check_delivery_person();
